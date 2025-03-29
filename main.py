@@ -1,125 +1,136 @@
-import socket
-import threading
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Command-line for audio compression."""
+
+import argparse
+from pathlib import Path
+import sys
 import time
-from queue import Queue
-from encodec import EncodecModel
-from encodec.utils import convert_audio
+
 import torchaudio
-import torch
 
-# UDP配置
-UDP_IP = "127.0.0.1"
-UDP_PORT = 9527
-PACKET_SIZE = 192  # 字节
-
-# 初始化Encodec模型
-model = EncodecModel.encodec_model_48khz()
-model.set_target_bandwidth(12.0)
-
-# 创建UDP socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 增加发送缓冲区
-
-# 音频处理参数
-CHUNK_DURATION = 0.1  # 每次处理的音频时长(秒)
-SAMPLE_RATE = model.sample_rate
-CHANNELS = model.channels
-CHUNK_SAMPLES = int(CHUNK_DURATION * SAMPLE_RATE)
-
-# Debug
-print("CHUNK_SAMPLES", CHUNK_SAMPLES)
-print("SAMPLE_RATE", SAMPLE_RATE)
-print("CHANNELS", CHANNELS)
-print("CHUNK_SAMPLES", CHUNK_SAMPLES)
-
-# 数据队列
-audio_queue = Queue(maxsize=10)
-code_queue = Queue(maxsize=10)
+from encodec.compress import compress, decompress, MODELS
+from encodec.utils import save_audio, convert_audio
 
 
-def audio_loader(audio_path):
-    """实时加载音频文件并分块"""
-    wav, sr = torchaudio.load(audio_path)
-    wav = convert_audio(wav, sr, SAMPLE_RATE, CHANNELS)
-
-    total_samples = wav.shape[-1]
-    pointer = 0
-
-    while pointer < total_samples:
-        end = min(pointer + CHUNK_SAMPLES, total_samples)
-        chunk = wav[:, pointer:end]
-
-        # 如果不足一个chunk，填充静音
-        if chunk.shape[-1] < CHUNK_SAMPLES:
-            padding = torch.zeros((CHANNELS, CHUNK_SAMPLES - chunk.shape[-1]))
-            chunk = torch.cat([chunk, padding], dim=-1)
-
-        audio_queue.put(chunk.unsqueeze(0))  # 添加batch维度
-        pointer = end
-        time.sleep(CHUNK_DURATION)  # 模拟实时
-
-    audio_queue.put(None)  # 结束信号
+SUFFIX = '.ecdc'
 
 
-def encode_worker():
-    """编码工作线程"""
-    while True:
-        chunk = audio_queue.get()
-        if chunk is None:
-            code_queue.put(None)
-            break
-
-        with torch.no_grad():
-            encoded_frames = model.encode(chunk)
-            codes = torch.cat([encoded[0] for encoded in encoded_frames], dim=-1)  # [B, n_q, T]
-            code_queue.put(codes.cpu().numpy())  # 转换为numpy数组
-
-
-def udp_sender():
-    """UDP发送线程"""
-    sequence_num = 0
-
-    while True:
-        codes = code_queue.get()
-        if codes is None:
-            break
-
-        # 将codes转换为字节流
-        codes_bytes = codes.tobytes()
-        total_length = len(codes_bytes)
-
-        # 分片发送
-        for offset in range(0, total_length, PACKET_SIZE):
-            chunk = codes_bytes[offset:offset + PACKET_SIZE]
-
-            # 添加简单的包头 (序列号+分片号)
-            header = sequence_num.to_bytes(4, 'big') + (offset // PACKET_SIZE).to_bytes(2, 'big')
-            packet = header + chunk
-
-            # # Debug
-            # print("Length: ", len(packet))
-            # print("Header Length: ", len(header))
-            # print("Chunk Size: ", len(chunk))
-
-            sock.sendto(packet, (UDP_IP, UDP_PORT))
-
-        sequence_num += 1
+def get_parser():
+    parser = argparse.ArgumentParser(
+        'encodec',
+        description='High fidelity neural audio codec. '
+                    'If input is a .ecdc, decompresses it. '
+                    'If input is .wav, compresses it. If output is also wav, '
+                    'do a compression/decompression cycle.')
+    parser.add_argument(
+        'input', type=Path,
+        help='Input file, whatever is supported by torchaudio on your system.')
+    parser.add_argument(
+        'output', type=Path, nargs='?',
+        help='Output file, otherwise inferred from input file.')
+    parser.add_argument(
+        '-b', '--bandwidth', type=float, default=6, choices=[1.5, 3., 6., 12., 24.],
+        help='Target bandwidth (1.5, 3, 6, 12 or 24). 1.5 is not supported with --hq.')
+    parser.add_argument(
+        '-q', '--hq', action='store_true',
+        help='Use HQ stereo model operating on 48 kHz sampled audio.')
+    parser.add_argument(
+        '-l', '--lm', action='store_true',
+        help='Use a language model to reduce the model size (5x slower though).')
+    parser.add_argument(
+        '-f', '--force', action='store_true',
+        help='Overwrite output file if it exists.')
+    parser.add_argument(
+        '-s', '--decompress_suffix', type=str, default='_decompressed',
+        help='Suffix for the decompressed output file (if no output path specified)')
+    parser.add_argument(
+        '-r', '--rescale', action='store_true',
+        help='Automatically rescale the output to avoid clipping.')
+    return parser
 
 
-if __name__ == "__main__":
-    # 启动工作线程
-    loader_thread = threading.Thread(target=audio_loader, args=("data/Zeraphym - Lifeline_cut_02_stereo.wav",))
-    encoder_thread = threading.Thread(target=encode_worker)
-    sender_thread = threading.Thread(target=udp_sender)
+def fatal(*args):
+    print(*args, file=sys.stderr)
+    sys.exit(1)
 
-    loader_thread.start()
-    encoder_thread.start()
-    sender_thread.start()
 
-    # 等待完成
-    loader_thread.join()
-    encoder_thread.join()
-    sender_thread.join()
+def check_output_exists(args):
+    if not args.output.parent.exists():
+        fatal(f"Output folder for {args.output} does not exist.")
+    if args.output.exists() and not args.force:
+        fatal(f"Output file {args.output} exist. Use -f / --force to overwrite.")
 
-    sock.close()
-    print("传输完成")
+
+def check_clipping(wav, args):
+    if args.rescale:
+        return
+    mx = wav.abs().max()
+    limit = 0.99
+    if mx > limit:
+        print(
+            f"Clipping!! max scale {mx}, limit is {limit}. "
+            "To avoid clipping, use the `-r` option to rescale the output.",
+            file=sys.stderr)
+
+
+def main():
+    args = get_parser().parse_args()
+    if not args.input.exists():
+        fatal(f"Input file {args.input} does not exist.")
+
+    start_time = time.time()
+    infer_start_time = None
+
+    if args.input.suffix.lower() == SUFFIX:
+        # Decompression
+        if args.output is None:
+            args.output = args.input.with_name(args.input.stem + args.decompress_suffix).with_suffix('.wav')
+        elif args.output.suffix.lower() != '.wav':
+            fatal("Output extension must be .wav")
+        check_output_exists(args)
+        out, out_sample_rate = decompress(args.input.read_bytes())
+        check_clipping(out, args)
+        save_audio(out, args.output, out_sample_rate, rescale=args.rescale)
+    else:
+        # Compression
+        if args.output is None:
+            args.output = args.input.with_suffix(SUFFIX)
+        elif args.output.suffix.lower() not in [SUFFIX, '.wav']:
+            fatal(f"Output extension must be .wav or {SUFFIX}")
+        check_output_exists(args)
+
+        model_name = 'encodec_48khz' if args.hq else 'encodec_24khz'
+        model = MODELS[model_name]()
+        if args.bandwidth not in model.target_bandwidths:
+            fatal(f"Bandwidth {args.bandwidth} is not supported by the model {model_name}")
+        model.set_target_bandwidth(args.bandwidth)
+
+        wav, sr = torchaudio.load(args.input)
+        wav = convert_audio(wav, sr, model.sample_rate, model.channels)
+
+        infer_start_time = time.time()
+
+        compressed = compress(model, wav, use_lm=args.lm)
+        if args.output.suffix.lower() == SUFFIX:
+            args.output.write_bytes(compressed)
+        else:
+            # Directly run decompression stage
+            assert args.output.suffix.lower() == '.wav'
+            out, out_sample_rate = decompress(compressed)
+            check_clipping(out, args)
+            save_audio(out, args.output, out_sample_rate, rescale=args.rescale)
+
+    end_time = time.time()
+
+    print(f"Elapsed time: {end_time - start_time:.6f} s")
+    if infer_start_time is not None:
+        print(f"Compressed time: {end_time - infer_start_time:.6f} s")
+
+
+if __name__ == '__main__':
+    main()
