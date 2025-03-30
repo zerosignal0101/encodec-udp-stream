@@ -26,7 +26,7 @@ EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 class AudioUDPSender:
     def __init__(self, model_name='encodec_48khz', use_lm=False, chunk_size=48000, target_ip='127.0.0.1',
-                 target_port=12345):
+                 target_port=12345, overlap_percent=1):
         """
         初始化UDP音频发送器
 
@@ -36,12 +36,15 @@ class AudioUDPSender:
             chunk_size: 音频分块大小（样本数）
             target_ip: 目标IP地址
             target_port: 目标端口
+            overlap_percent: 相邻块之间的重叠百分比
         """
         self.model_name = model_name
         self.use_lm = use_lm
         self.chunk_size = chunk_size
         self.target_ip = target_ip
         self.target_port = target_port
+        self.overlap_percent = overlap_percent
+        self.overlap_size = int(chunk_size * overlap_percent / 100)
 
         # 初始化Encodec模型
         self.device = torch.device("cpu")
@@ -97,36 +100,64 @@ class AudioUDPSender:
 
         print(f"发送音频: {audio_file_path}")
         print(f"总样本数: {num_samples}, 采样率: {self.sample_rate}")
+        print(f"重叠区域大小: {self.overlap_size} 样本 ({self.overlap_percent}%)")
+
+        # 创建平滑过渡的淡入淡出窗口
+        fade_in = torch.linspace(0, 1, self.overlap_size, device=wav.device).view(1, -1)
+        fade_out = 1 - fade_in
+
+        effective_chunk_size = self.chunk_size - self.overlap_size
+        last_end = 0
 
         # 按块处理和发送
-        for start in range(0, num_samples, self.chunk_size):
+        for start in range(0, num_samples, effective_chunk_size):
             end = min(start + self.chunk_size, num_samples)
-            chunk = wav[:, start:end]
+            chunk = wav[:, start:end].clone()  # 使用clone避免修改原始数据
+
+            # 应用淡入淡出以平滑重叠区域
+            if start > 0 and start + self.overlap_size <= num_samples:
+                # # 对重叠部分应用淡入
+                # chunk[:, :self.overlap_size] *= fade_in
+
+                # 在发送这个区域时，也将其发送给接收端
+                overlap_info = struct.pack("!I", 1)  # 1表示这个包包含重叠区域
+            else:
+                # 第一个块没有重叠区域
+                overlap_info = struct.pack("!I", 0)  # 0表示这个包不包含重叠区域
+
+            # # 如果不是最后一个块，准备下一个块的重叠
+            # if end < num_samples and end - self.overlap_size >= 0:
+            #     # 对当前块末尾应用淡出，为下一块的重叠做准备
+            #     chunk[:, -self.overlap_size:] *= fade_out
 
             # 压缩音频块
             compressed_data = self.compress_chunk(chunk)
 
-            # 创建UDP包头 (序列号 + 数据长度)
-            header = struct.pack("!II", self.seq_num, len(compressed_data))
+            # 创建UDP包头 (序列号 + 数据长度 + 重叠信息)
+            header = struct.pack("!II", self.seq_num, len(compressed_data)) + overlap_info
 
             # 发送数据包
             packet = header + compressed_data
             self.sock.sendto(packet, (self.target_ip, self.target_port))
 
-            print(f"发送数据包 #{self.seq_num}: {len(compressed_data)} 字节")
+            print(
+                f"发送数据包 #{self.seq_num}: {len(compressed_data)} 字节, 重叠: {'是' if overlap_info[0] == 1 else '否'}")
             self.seq_num += 1
+            last_end = end
 
             # 模拟实时流式传输的延迟
-            time.sleep(chunk.shape[-1] / self.sample_rate * 0.90)  # 略快一点发送，防止播放端缓冲区空
+            # 只等待非重叠部分的时间，因为重叠部分已经在上一块中播放
+            wait_time = (chunk.shape[-1] - (self.overlap_size if start > 0 else 0)) / self.sample_rate * 0.80
+            time.sleep(wait_time)  # 略快一点发送，防止播放端缓冲区空
 
         # 发送结束标记
-        end_header = struct.pack("!II", self.seq_num, 0)
+        end_header = struct.pack("!II", self.seq_num, 0) + struct.pack("!I", 0)
         self.sock.sendto(end_header, (self.target_ip, self.target_port))
         print("音频传输完成")
 
 
 class AudioUDPReceiver:
-    def __init__(self, model_name='encodec_48khz', buffer_size=16, listen_port=12345):
+    def __init__(self, model_name='encodec_48khz', buffer_size=16, listen_port=12345, overlap_percent=1):
         """
         初始化UDP音频接收器
 
@@ -134,10 +165,12 @@ class AudioUDPReceiver:
             model_name: Encodec模型名称
             buffer_size: 音频缓冲区大小（帧数）
             listen_port: 监听端口
+            overlap_percent: 相邻块之间的重叠百分比
         """
         self.model_name = model_name
         self.buffer_size = buffer_size
         self.listen_port = listen_port
+        self.overlap_percent = overlap_percent
 
         # 初始化Encodec模型
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,6 +196,10 @@ class AudioUDPReceiver:
 
         # 最后播放的序列号
         self.last_played_seq = -1
+
+        # 存储上一个块的重叠区域
+        self.previous_overlap = None
+        self.overlap_size = None  # 将在接收到第一个块时确定
 
     def decompress_chunk(self, compressed_data):
         """解压缩音频块"""
@@ -241,8 +278,8 @@ class AudioUDPReceiver:
                 data, addr = self.sock.recvfrom(65536)  # UDP包最大大小
 
                 # 解析头部
-                header_size = struct.calcsize("!II")
-                seq_num, data_len = struct.unpack("!II", data[:header_size])
+                header_size = struct.calcsize("!III")  # 增加重叠信息字段
+                seq_num, data_len, has_overlap = struct.unpack("!III", data[:header_size])
 
                 # 如果是结束标记，则退出
                 if data_len == 0:
@@ -260,11 +297,45 @@ class AudioUDPReceiver:
                     print(f"重复数据包 #{seq_num}，跳过")
                     continue
 
-                print(f"接收数据包 #{seq_num}: {data_len} 字节")
+                print(f"接收数据包 #{seq_num}: {data_len} 字节, 包含重叠: {'是' if has_overlap else '否'}")
                 self.received_packets.add(seq_num)
 
                 # 解压缩
                 wav_chunk = self.decompress_chunk(compressed_data)
+
+                # 如果是第一个块，初始化重叠大小
+                if self.overlap_size is None and wav_chunk.shape[-1] > 0:
+                    # 假设重叠大小是总块大小的overlap_percent%
+                    self.overlap_size = int(wav_chunk.shape[-1] * self.overlap_percent / 100)
+                    print(f"初始化重叠区域大小: {self.overlap_size} 样本")
+
+                # 处理重叠区域
+                if has_overlap and self.previous_overlap is not None:
+                    # 创建淡入淡出窗口
+                    device = wav_chunk.device
+                    fade_in = torch.linspace(0, 1, self.overlap_size, device=device).view(1, -1)
+                    fade_out = 1 - fade_in
+
+                    # 应用淡入淡出混合重叠区域
+                    # 当前块的开头部分淡入
+                    wav_chunk[:, :self.overlap_size] *= fade_in
+                    # 上一个块的结尾部分淡出
+                    self.previous_overlap *= fade_out
+                    # 混合重叠区域
+                    wav_chunk[:, :self.overlap_size] += self.previous_overlap
+
+                # 保存当前块结尾用于下一次重叠
+                if wav_chunk.shape[-1] >= self.overlap_size:
+                    self.previous_overlap = wav_chunk[:, -self.overlap_size:].clone()
+                else:
+                    self.previous_overlap = None
+
+                # 移除当前块的结尾部分
+                if wav_chunk.shape[-1] >= self.overlap_size:
+                    wav_chunk = wav_chunk[:, :(wav_chunk.shape[-1] - self.overlap_size)]
+
+                # Debug
+                print("Chunk shape: ", wav_chunk.shape)
 
                 # 添加到缓冲区
                 with self.buffer_lock:
@@ -337,6 +408,7 @@ def main():
     parser.add_argument('--ip', type=str, default='127.0.0.1', help='接收端IP地址 (仅发送模式)')
     parser.add_argument('--port', type=int, default=12345, help='UDP端口')
     parser.add_argument('--no-lm', action='store_true', help='不使用语言模型压缩')
+    parser.add_argument('--overlap', type=float, default=1.0, help='相邻块重叠百分比 (默认: 1%)')
     args = parser.parse_args()
 
     if args.mode == 'send':
@@ -346,12 +418,16 @@ def main():
         sender = AudioUDPSender(
             use_lm=not args.no_lm,
             target_ip=args.ip,
-            target_port=args.port
+            target_port=args.port,
+            overlap_percent=args.overlap
         )
         sender.send_audio_file(args.input)
 
     elif args.mode == 'receive':
-        receiver = AudioUDPReceiver(listen_port=args.port)
+        receiver = AudioUDPReceiver(
+            listen_port=args.port,
+            overlap_percent=args.overlap
+        )
         receiver.start()
 
         try:
