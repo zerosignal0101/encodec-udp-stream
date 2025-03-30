@@ -21,6 +21,9 @@ MODELS = {
     'encodec_48khz': EncodecModel.encodec_model_48khz,
 }
 
+# Fragment size in bytes (excluding headers)
+FRAGMENT_SIZE = 192
+
 EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
@@ -66,6 +69,8 @@ class AudioUDPSender:
 
         # 序列号
         self.seq_num = 0
+        # 碎片序列号
+        self.fragment_id = 0
 
     def compress_chunk(self, wav_chunk):
         """压缩单个音频块"""
@@ -87,6 +92,42 @@ class AudioUDPSender:
 
         return compressed_data
 
+    def send_fragmented_packet(self, compressed_data, seq_num, has_overlap):
+        """将压缩数据分解为小片段并发送"""
+        # 计算需要的片段数
+        total_fragments = math.ceil(len(compressed_data) / FRAGMENT_SIZE)
+
+        # 创建共同的包头信息
+        common_header = struct.pack("!III", seq_num, len(compressed_data), 1 if has_overlap else 0)
+
+        print(f"将数据包 #{seq_num} 分片为 {total_fragments} 个小片段 (总大小: {len(compressed_data)} 字节)")
+
+        # 分片并发送
+        for i in range(total_fragments):
+            # 确定当前片段的数据范围
+            start = i * FRAGMENT_SIZE
+            end = min(start + FRAGMENT_SIZE, len(compressed_data))
+
+            # 提取当前片段
+            fragment = compressed_data[start:end]
+
+            # 片段特定头部: [片段ID, 总片段数, 当前片段序号, 片段大小]
+            fragment_header = struct.pack("!IIII", self.fragment_id, total_fragments, i, len(fragment))
+
+            # 组装完整的片段包: [共同包头 + 片段头部 + 片段数据]
+            packet = common_header + fragment_header + fragment
+
+            # 发送片段
+            self.sock.sendto(packet, (self.target_ip, self.target_port))
+
+            # 短暂延迟，防止网络拥塞
+            time.sleep(0.001)
+
+        # 递增片段ID
+        self.fragment_id += 1
+
+        return total_fragments
+
     def send_audio_file(self, audio_file_path):
         """发送音频文件"""
         # 加载音频文件
@@ -101,6 +142,7 @@ class AudioUDPSender:
         print(f"发送音频: {audio_file_path}")
         print(f"总样本数: {num_samples}, 采样率: {self.sample_rate}")
         print(f"重叠区域大小: {self.overlap_size} 样本 ({self.overlap_percent}%)")
+        print(f"片段大小: {FRAGMENT_SIZE} 字节")
 
         # 创建平滑过渡的淡入淡出窗口
         fade_in = torch.linspace(0, 1, self.overlap_size, device=wav.device).view(1, -1)
@@ -118,12 +160,10 @@ class AudioUDPSender:
             if start > 0 and start + self.overlap_size <= num_samples:
                 # # 对重叠部分应用淡入
                 # chunk[:, :self.overlap_size] *= fade_in
-
-                # 在发送这个区域时，也将其发送给接收端
-                overlap_info = struct.pack("!I", 1)  # 1表示这个包包含重叠区域
+                has_overlap = True
             else:
                 # 第一个块没有重叠区域
-                overlap_info = struct.pack("!I", 0)  # 0表示这个包不包含重叠区域
+                has_overlap = False
 
             # # 如果不是最后一个块，准备下一个块的重叠
             # if end < num_samples and end - self.overlap_size >= 0:
@@ -133,15 +173,10 @@ class AudioUDPSender:
             # 压缩音频块
             compressed_data = self.compress_chunk(chunk)
 
-            # 创建UDP包头 (序列号 + 数据长度 + 重叠信息)
-            header = struct.pack("!II", self.seq_num, len(compressed_data)) + overlap_info
+            # 分片发送数据包
+            total_fragments = self.send_fragmented_packet(compressed_data, self.seq_num, has_overlap)
 
-            # 发送数据包
-            packet = header + compressed_data
-            self.sock.sendto(packet, (self.target_ip, self.target_port))
-
-            print(
-                f"发送数据包 #{self.seq_num}: {len(compressed_data)} 字节, 重叠: {'是' if overlap_info[0] == 1 else '否'}")
+            print(f"发送数据包 #{self.seq_num}: 分为 {total_fragments} 个片段, 重叠: {'是' if has_overlap else '否'}")
             self.seq_num += 1
             last_end = end
 
@@ -151,8 +186,11 @@ class AudioUDPSender:
             time.sleep(wait_time)  # 略快一点发送，防止播放端缓冲区空
 
         # 发送结束标记
-        end_header = struct.pack("!II", self.seq_num, 0) + struct.pack("!I", 0)
-        self.sock.sendto(end_header, (self.target_ip, self.target_port))
+        end_header = struct.pack("!III", self.seq_num, 0, 0)
+        # 片段特定头部: [片段ID, 总片段数, 当前片段序号, 片段大小]
+        fragment_header = struct.pack("!IIII", self.fragment_id, 1, 0, 0)
+        end_packet = end_header + fragment_header
+        self.sock.sendto(end_packet, (self.target_ip, self.target_port))
         print("音频传输完成")
 
 
@@ -174,7 +212,6 @@ class AudioUDPReceiver:
 
         # 初始化Encodec模型
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = MODELS[f'{self.model_name}']().to(self.device)
         self.sample_rate = self.model.sample_rate
         self.channels = self.model.channels
@@ -200,6 +237,9 @@ class AudioUDPReceiver:
         # 存储上一个块的重叠区域
         self.previous_overlap = None
         self.overlap_size = None  # 将在接收到第一个块时确定
+
+        # 片段重组缓冲区
+        self.fragment_buffer = {}  # {seq_num: {fragment_id: {total_fragments, received_fragments, data}}}
 
     def decompress_chunk(self, compressed_data):
         """解压缩音频块"""
@@ -264,91 +304,137 @@ class AudioUDPReceiver:
         with torch.no_grad():
             wav = self.model.decode(frames)
         wav = wav[0, :, :audio_length]
-        # # Debug
-        # print("Wav shape: ", wav.shape)
         return wav
+
+    def process_fragment(self, data, addr):
+        """处理接收到的片段"""
+        # 解析共同头部 [序列号, 总数据长度, 是否有重叠]
+        common_header_size = struct.calcsize("!III")
+        seq_num, data_len, has_overlap = struct.unpack("!III", data[:common_header_size])
+
+        # 如果是结束标记
+        if data_len == 0:
+            print(f"收到结束标记 (序列号 {seq_num})")
+            # 等待所有数据播放完毕
+            time.sleep(2)
+            self.running = False
+            return
+
+        # 解析片段头部 [片段ID, 总片段数, 当前片段序号, 片段大小]
+        fragment_header_start = common_header_size
+        fragment_header_size = struct.calcsize("!IIII")
+        fragment_id, total_fragments, fragment_index, fragment_size = struct.unpack(
+            "!IIII", data[fragment_header_start:fragment_header_start + fragment_header_size])
+
+        # 提取片段数据
+        fragment_data_start = fragment_header_start + fragment_header_size
+        fragment_data = data[fragment_data_start:fragment_data_start + fragment_size]
+
+        # 检查序列号是否已经在缓冲区中
+        if seq_num not in self.fragment_buffer:
+            # 如果是新的序列号，创建新的缓冲区条目
+            self.fragment_buffer[seq_num] = {
+                'fragment_id': fragment_id,
+                'total_fragments': total_fragments,
+                'has_overlap': has_overlap,
+                'data_len': data_len,
+                'fragments': {},
+                'complete': False
+            }
+
+        # 存储片段
+        self.fragment_buffer[seq_num]['fragments'][fragment_index] = fragment_data
+
+        # 检查是否所有片段都已接收
+        if len(self.fragment_buffer[seq_num]['fragments']) == total_fragments:
+            # 所有片段已接收，合并数据
+            self.fragment_buffer[seq_num]['complete'] = True
+            print(f"数据包 #{seq_num} 的所有片段已接收 ({total_fragments} 个片段)")
+
+            # 组装完整数据
+            complete_data = bytearray()
+            for i in range(total_fragments):
+                complete_data.extend(self.fragment_buffer[seq_num]['fragments'][i])
+
+            # 检查是否与预期长度匹配
+            if len(complete_data) != data_len:
+                print(f"警告: 合并数据长度 ({len(complete_data)}) 与预期 ({data_len}) 不匹配")
+
+            # 处理完整数据包
+            self.process_complete_packet(seq_num, complete_data, has_overlap)
+
+            # 清理缓冲区
+            del self.fragment_buffer[seq_num]
+
+    def process_complete_packet(self, seq_num, compressed_data, has_overlap):
+        """处理完整的数据包"""
+        # 检查是否已经接收过此包
+        if seq_num in self.received_packets:
+            print(f"重复数据包 #{seq_num}，跳过")
+            return
+
+        print(f"处理完整数据包 #{seq_num}: {len(compressed_data)} 字节, 包含重叠: {'是' if has_overlap else '否'}")
+        self.received_packets.add(seq_num)
+
+        # 解压缩
+        wav_chunk = self.decompress_chunk(compressed_data)
+
+        # 如果是第一个块，初始化重叠大小
+        if self.overlap_size is None and wav_chunk.shape[-1] > 0:
+            # 假设重叠大小是总块大小的overlap_percent%
+            self.overlap_size = int(wav_chunk.shape[-1] * self.overlap_percent / 100)
+            print(f"初始化重叠区域大小: {self.overlap_size} 样本")
+
+        # 处理重叠区域
+        if has_overlap and self.previous_overlap is not None:
+            # 创建淡入淡出窗口
+            device = wav_chunk.device
+            fade_in = torch.linspace(0, 1, self.overlap_size, device=device).view(1, -1)
+            fade_out = 1 - fade_in
+
+            # 应用淡入淡出混合重叠区域
+            # 当前块的开头部分淡入
+            wav_chunk[:, :self.overlap_size] *= fade_in
+            # 上一个块的结尾部分淡出
+            self.previous_overlap *= fade_out
+            # 混合重叠区域
+            wav_chunk[:, :self.overlap_size] += self.previous_overlap
+
+        # 保存当前块结尾用于下一次重叠
+        if wav_chunk.shape[-1] >= self.overlap_size:
+            self.previous_overlap = wav_chunk[:, -self.overlap_size:].clone()
+        else:
+            self.previous_overlap = None
+
+        # 移除当前块的结尾部分
+        if wav_chunk.shape[-1] >= self.overlap_size:
+            wav_chunk = wav_chunk[:, :(wav_chunk.shape[-1] - self.overlap_size)]
+
+        # Debug
+        print("Chunk shape: ", wav_chunk.shape)
+
+        # 添加到缓冲区
+        with self.buffer_lock:
+            # 添加 (seq_num, wav_chunk) 元组到缓冲区
+            self.audio_buffer.append((seq_num, wav_chunk))
+            # 按序列号排序
+            self.audio_buffer.sort(key=lambda x: x[0])
+
+        # 如果缓冲区足够大，开始播放
+        if not self.playback_started and len(self.audio_buffer) >= self.buffer_size // 2:
+            self.playback_started = True
+            threading.Thread(target=self.playback_thread).start()
 
     def receive_thread(self):
         """接收线程"""
         print(f"开始接收音频数据, 监听端口: {self.listen_port}")
+        print(f"片段大小: {FRAGMENT_SIZE} 字节")
 
         while self.running:
             try:
                 # 接收数据包
-                data, addr = self.sock.recvfrom(65536)  # UDP包最大大小
-
-                # 解析头部
-                header_size = struct.calcsize("!III")  # 增加重叠信息字段
-                seq_num, data_len, has_overlap = struct.unpack("!III", data[:header_size])
-
-                # 如果是结束标记，则退出
-                if data_len == 0:
-                    print(f"收到结束标记 (序列号 {seq_num})")
-                    # 等待所有数据播放完毕
-                    time.sleep(2)
-                    self.running = False
-                    break
-
-                # 提取音频数据
-                compressed_data = data[header_size:]
-
-                # 检查是否已经接收过此包
-                if seq_num in self.received_packets:
-                    print(f"重复数据包 #{seq_num}，跳过")
-                    continue
-
-                print(f"接收数据包 #{seq_num}: {data_len} 字节, 包含重叠: {'是' if has_overlap else '否'}")
-                self.received_packets.add(seq_num)
-
-                # 解压缩
-                wav_chunk = self.decompress_chunk(compressed_data)
-
-                # 如果是第一个块，初始化重叠大小
-                if self.overlap_size is None and wav_chunk.shape[-1] > 0:
-                    # 假设重叠大小是总块大小的overlap_percent%
-                    self.overlap_size = int(wav_chunk.shape[-1] * self.overlap_percent / 100)
-                    print(f"初始化重叠区域大小: {self.overlap_size} 样本")
-
-                # 处理重叠区域
-                if has_overlap and self.previous_overlap is not None:
-                    # 创建淡入淡出窗口
-                    device = wav_chunk.device
-                    fade_in = torch.linspace(0, 1, self.overlap_size, device=device).view(1, -1)
-                    fade_out = 1 - fade_in
-
-                    # 应用淡入淡出混合重叠区域
-                    # 当前块的开头部分淡入
-                    wav_chunk[:, :self.overlap_size] *= fade_in
-                    # 上一个块的结尾部分淡出
-                    self.previous_overlap *= fade_out
-                    # 混合重叠区域
-                    wav_chunk[:, :self.overlap_size] += self.previous_overlap
-
-                # 保存当前块结尾用于下一次重叠
-                if wav_chunk.shape[-1] >= self.overlap_size:
-                    self.previous_overlap = wav_chunk[:, -self.overlap_size:].clone()
-                else:
-                    self.previous_overlap = None
-
-                # 移除当前块的结尾部分
-                if wav_chunk.shape[-1] >= self.overlap_size:
-                    wav_chunk = wav_chunk[:, :(wav_chunk.shape[-1] - self.overlap_size)]
-
-                # Debug
-                print("Chunk shape: ", wav_chunk.shape)
-
-                # 添加到缓冲区
-                with self.buffer_lock:
-                    # 添加 (seq_num, wav_chunk) 元组到缓冲区
-                    self.audio_buffer.append((seq_num, wav_chunk))
-                    # 按序列号排序
-                    self.audio_buffer.sort(key=lambda x: x[0])
-
-                # 如果缓冲区足够大，开始播放
-                if not self.playback_started and len(self.audio_buffer) >= self.buffer_size // 2:
-                    self.playback_started = True
-                    threading.Thread(target=self.playback_thread).start()
-
+                data, addr = self.sock.recvfrom(2048)  # 比最大片段稍大一些的缓冲区
+                self.process_fragment(data, addr)
             except Exception as e:
                 print(f"接收错误: {e}")
 
@@ -367,6 +453,7 @@ class AudioUDPReceiver:
         while self.running or self.audio_buffer:
             with self.buffer_lock:
                 if not self.audio_buffer:
+                    time.sleep(0.01)
                     continue
 
                 # 获取下一个要播放的音频帧
@@ -409,6 +496,8 @@ def main():
     parser.add_argument('--port', type=int, default=12345, help='UDP端口')
     parser.add_argument('--no-lm', action='store_true', help='不使用语言模型压缩')
     parser.add_argument('--overlap', type=float, default=1.0, help='相邻块重叠百分比 (默认: 1%)')
+    parser.add_argument('--fragment-size', type=int, default=FRAGMENT_SIZE,
+                        help=f'片段大小 (默认: {FRAGMENT_SIZE} 字节)')
     args = parser.parse_args()
 
     if args.mode == 'send':
@@ -442,6 +531,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
