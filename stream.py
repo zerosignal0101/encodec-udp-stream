@@ -28,7 +28,7 @@ EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
 class AudioUDPSender:
-    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=12000, target_ip='127.0.0.1',
+    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=24000, target_ip='127.0.0.1',
                  target_port=12345, overlap_percent=1):
         """
         初始化UDP音频发送器
@@ -60,9 +60,9 @@ class AudioUDPSender:
         if self.model_name == 'encodec_48khz':
             self.model.set_target_bandwidth(12)
 
-        # 24kHz 模型设置为 6kbps
+        # 24kHz 模型设置为 12kbps
         if self.model_name == 'encodec_24khz':
-            self.model.set_target_bandwidth(6)
+            self.model.set_target_bandwidth(12)
 
         # 初始化UDP socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,6 +153,9 @@ class AudioUDPSender:
 
         # 按块处理和发送
         for start in range(0, num_samples, effective_chunk_size):
+            # 计时器
+            chunk_process_start_time = time.time()
+
             end = min(start + self.chunk_size, num_samples)
             chunk = wav[:, start:end].clone()  # 使用clone避免修改原始数据
 
@@ -181,9 +184,16 @@ class AudioUDPSender:
             last_end = end
 
             # 模拟实时流式传输的延迟
+            chunk_process_end_time = time.time()
+            delta_seconds = chunk_process_end_time - chunk_process_start_time
             # 只等待非重叠部分的时间，因为重叠部分已经在上一块中播放
-            wait_time = (chunk.shape[-1] - (self.overlap_size if start > 0 else 0)) / self.sample_rate * 0.6
-            time.sleep(wait_time)  # 略快一点发送，防止播放端缓冲区空
+            wait_time = (chunk.shape[-1] - (self.overlap_size if start > 0 else 0)) / self.sample_rate - delta_seconds
+            # 略微加快速度发送
+            wait_time *= 0.95
+            if wait_time > 0:
+                time.sleep(wait_time)  # 略快一点发送，防止播放端缓冲区空
+            else:
+                print("Warning: 计算速度不能实时发送")
 
         # 发送结束标记
         end_header = struct.pack("!III", self.seq_num, 0, 0)
@@ -254,6 +264,7 @@ class AudioUDPReceiver:
         if model_name not in MODELS:
             raise ValueError(f"The audio was compressed with an unsupported model {model_name}.")
         if model_name != self.model_name:
+            print(f"Warning: 模型发生改变，由 {self.model_name} 切换为 {model_name}")
             self.model_name = model_name
             self.model = MODELS[f'{self.model_name}']().to(self.device)
             self.sample_rate = self.model.sample_rate
@@ -410,8 +421,8 @@ class AudioUDPReceiver:
         if wav_chunk.shape[-1] >= self.overlap_size:
             wav_chunk = wav_chunk[:, :(wav_chunk.shape[-1] - self.overlap_size)]
 
-        # Debug
-        print("Chunk shape: ", wav_chunk.shape)
+        # # Debug
+        # print("解包音频片段 shape: ", wav_chunk.shape)
 
         # 添加到缓冲区
         with self.buffer_lock:
@@ -421,7 +432,7 @@ class AudioUDPReceiver:
             self.audio_buffer.sort(key=lambda x: x[0])
 
         # 如果缓冲区足够大，开始播放
-        if not self.playback_started and len(self.audio_buffer) >= self.buffer_size // 2:
+        if not self.playback_started and len(self.audio_buffer) >= self.buffer_size // 4:
             self.playback_started = True
             threading.Thread(target=self.playback_thread).start()
 
