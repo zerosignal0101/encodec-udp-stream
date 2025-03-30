@@ -28,7 +28,7 @@ EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
 class AudioUDPSender:
-    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=24000, target_ip='127.0.0.1',
+    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=3000, target_ip='127.0.0.1',
                  target_port=12345, overlap_percent=1):
         """
         初始化UDP音频发送器
@@ -50,8 +50,7 @@ class AudioUDPSender:
         self.overlap_size = int(chunk_size * overlap_percent / 100)
 
         # 初始化Encodec模型
-        self.device = torch.device("cpu")
-        # torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = MODELS[f'{self.model_name}']().to(self.device)
         self.sample_rate = self.model.sample_rate
         self.channels = self.model.channels
@@ -135,6 +134,7 @@ class AudioUDPSender:
 
         # 转换到目标格式
         wav = convert_audio(wav, sr, self.sample_rate, self.channels)
+        wav = wav.to(self.device)
 
         # 分块处理
         num_samples = wav.shape[-1]
