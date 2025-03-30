@@ -32,9 +32,7 @@ This project implements a low-latency UDP-based audio streaming system leveragin
 
 ### **3. Audio Processing**
 - **Overlap-Add (OLA) smoothing**:
-  $$
-  y[n] = x_{prev}[n] \cdot w_{fade-out} + x_{current}[n] \cdot w_{fade-in}
-  $$
+  $y[n] = x_{prev}[n] \cdot w_{fade-out} + x_{current}[n] \cdot w_{fade-in}$
   where $w$ is a triangular window (1-50% overlap configurable)
 - **Jitter buffer** (16-frame default) for stable playback
 
@@ -60,7 +58,6 @@ python stream.py --mode receive \
 ## **Dependencies**
 - Encodec (`facebookresearch/encodec`)
 - SoundDevice 0.4+
-- NumPy
 
 ## **Limitations**
 - No FEC (Forward Error Correction)
