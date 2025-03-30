@@ -28,7 +28,7 @@ EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
 class AudioUDPSender:
-    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=3000, target_ip='127.0.0.1',
+    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=6000, target_ip='127.0.0.1',
                  target_port=12345, overlap_percent=1):
         """
         初始化UDP音频发送器
@@ -507,8 +507,6 @@ def main():
     parser.add_argument('--port', type=int, default=12345, help='UDP端口')
     parser.add_argument('--no-lm', action='store_true', help='不使用语言模型压缩')
     parser.add_argument('--overlap', type=float, default=1.0, help='相邻块重叠百分比 (默认: 1%)')
-    parser.add_argument('--fragment-size', type=int, default=FRAGMENT_SIZE,
-                        help=f'片段大小 (默认: {FRAGMENT_SIZE} 字节)')
     args = parser.parse_args()
 
     if args.mode == 'send':
