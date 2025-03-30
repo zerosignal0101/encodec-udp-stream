@@ -27,14 +27,14 @@ This project implements a low-latency UDP-based audio streaming system leveragin
       uint8_t  payload[];     // Encoded audio data
   }
   ```
-- **192-byte MTU** fragmentation for NAT traversal
+- **220-byte MTU** fragmentation for NAT traversal
 - Sequential reassembly with duplicate detection
 
 ### **3. Audio Processing**
 - **Overlap-Add (OLA) smoothing**:
-  ```math
+  $$
   y[n] = x_{prev}[n] \cdot w_{fade-out} + x_{current}[n] \cdot w_{fade-in}
-  ```
+  $$
   where $w$ is a triangular window (1-50% overlap configurable)
 - **Jitter buffer** (16-frame default) for stable playback
 
@@ -67,4 +67,5 @@ python stream.py --mode receive \
 - Requires GPU for optimal performance
 
 ## **Future Work**
+- [ ] Stream audio from mic source
 - [ ] Multi-track audio transmission
