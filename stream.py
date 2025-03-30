@@ -28,7 +28,7 @@ EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
 
 class AudioUDPSender:
-    def __init__(self, model_name='encodec_48khz', use_lm=False, chunk_size=48000, target_ip='127.0.0.1',
+    def __init__(self, model_name='encodec_24khz', use_lm=False, chunk_size=12000, target_ip='127.0.0.1',
                  target_port=12345, overlap_percent=1):
         """
         初始化UDP音频发送器
@@ -182,7 +182,7 @@ class AudioUDPSender:
 
             # 模拟实时流式传输的延迟
             # 只等待非重叠部分的时间，因为重叠部分已经在上一块中播放
-            wait_time = (chunk.shape[-1] - (self.overlap_size if start > 0 else 0)) / self.sample_rate * 0.80
+            wait_time = (chunk.shape[-1] - (self.overlap_size if start > 0 else 0)) / self.sample_rate * 0.6
             time.sleep(wait_time)  # 略快一点发送，防止播放端缓冲区空
 
         # 发送结束标记
@@ -195,7 +195,7 @@ class AudioUDPSender:
 
 
 class AudioUDPReceiver:
-    def __init__(self, model_name='encodec_48khz', buffer_size=16, listen_port=12345, overlap_percent=1):
+    def __init__(self, model_name='encodec_24khz', buffer_size=16, listen_port=12345, overlap_percent=1):
         """
         初始化UDP音频接收器
 
